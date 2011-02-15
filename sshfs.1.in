@@ -43,6 +43,10 @@ equivalent to '\-o compression=yes'
 \fB\-F\fR ssh_configfile
 specifies alternative ssh configuration file
 .TP
+\fB\-S\fR ssh_control_path
+uses the specified control socket to reuse a established ssh connection
+(see the ControlMaster and ControlPath option in man ssh_config)
+.TP
 \fB\-1\fR
 equivalent to '\-o ssh_protocol=1'
 .TP

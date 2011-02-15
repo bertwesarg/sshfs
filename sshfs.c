@@ -39,6 +39,7 @@
 #include <sys/utsname.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <glib.h>
@@ -52,6 +53,8 @@
 #endif
 
 #include "cache.h"
+
+#include "fdpass.h"
 
 #ifndef MAP_LOCKED
 #define MAP_LOCKED 0
@@ -144,6 +147,28 @@
 static char sshfs_program_path[PATH_MAX] = { 0 };
 #endif /* __APPLE__ */
 
+/* Open SSH mux op codes (from PROTOCOL.mux) */
+#define SSHMUX_MSG_HELLO            0x00000001
+#define SSHMUX_C_NEW_SESSION        0x10000002
+#define SSHMUX_C_ALIVE_CHECK        0x10000004
+#define SSHMUX_C_TERMINATE          0x10000005
+#define SSHMUX_C_OPEN_FWD           0x10000006
+#define SSHMUX_C_CLOSE_FWD          0x10000007
+#define SSHMUX_C_NEW_STDIO_FWD      0x10000008
+#define SSHMUX_S_OK                 0x80000001
+#define SSHMUX_S_PERMISSION_DENIED  0x80000002
+#define SSHMUX_S_FAILURE            0x80000003
+#define SSHMUX_S_EXIT_MESSAGE       0x80000004
+#define SSHMUX_S_ALIVE              0x80000005
+#define SSHMUX_S_SESSION_OPENED     0x80000006
+#define SSHMUX_S_REMOTE_PORT        0x80000007
+
+#define SSHMUX_FWD_LOCAL    1
+#define SSHMUX_FWD_REMOTE   2
+#define SSHMUX_FWD_DYNAMIC  3
+
+#define SSHMUX_VERSION  4
+
 struct buffer {
 	uint8_t *p;
 	size_t len;
@@ -213,6 +238,7 @@ struct sshfs {
 	char *directport;
 	char *ssh_command;
 	char *sftp_server;
+	char *control_path;
 	struct fuse_args ssh_args;
 	char *workarounds;
 	int rename_workaround;
@@ -256,6 +282,7 @@ struct sshfs {
 	int wfd;
 	int ptyfd;
 	int ptyslavefd;
+	int control_sock;
 	int connver;
 	int server_version;
 	unsigned remote_uid;
@@ -349,6 +376,7 @@ enum {
 	KEY_VERSION,
 	KEY_FOREGROUND,
 	KEY_CONFIGFILE,
+	KEY_CONTROLPATH,
 };
 
 enum {
@@ -368,6 +396,7 @@ static struct fuse_opt sshfs_opts[] = {
 	SSHFS_OPT("directport=%s",     directport, 0),
 	SSHFS_OPT("ssh_command=%s",    ssh_command, 0),
 	SSHFS_OPT("sftp_server=%s",    sftp_server, 0),
+	SSHFS_OPT("control_path=%s",   control_path, 0),
 	SSHFS_OPT("max_read=%u",       max_read, 0),
 	SSHFS_OPT("max_write=%u",      max_write, 0),
 	SSHFS_OPT("ssh_protocol=%u",   ssh_ver, 0),
@@ -403,6 +432,7 @@ static struct fuse_opt sshfs_opts[] = {
 	FUSE_OPT_KEY("-d",             KEY_FOREGROUND),
 	FUSE_OPT_KEY("-f",             KEY_FOREGROUND),
 	FUSE_OPT_KEY("-F ",            KEY_CONFIGFILE),
+	FUSE_OPT_KEY("-S ",            KEY_CONTROLPATH),
 	FUSE_OPT_END
 };
 
@@ -1216,11 +1246,195 @@ static int connect_to(char *host, char *port)
 	return 0;
 }
 
-static int do_write(struct iovec *iov, size_t count)
+static int do_write(int fd, struct iovec *iov, size_t count);
+static void buf_to_iov(const struct buffer *buf, struct iovec *iov);
+static int do_read(int fd, struct buffer *buf);
+
+static int recv_mux_message(int fd, struct buffer *msg)
+{
+    struct buffer len_buf;
+    uint32_t len;
+
+    len_buf.p = (uint8_t*)&len;
+    len_buf.len = 0;
+    len_buf.size = 4;
+
+    if (do_read(fd, &len_buf) == -1)
+        return -1;
+
+    buf_init(msg, ntohl(len));
+    if (do_read(fd, msg) != -1)
+        return 0;
+
+    buf_clear(msg);
+    return -1;
+}
+
+static int send_mux_message(int fd, struct buffer *msg)
+{
+    struct buffer pkt;
+    struct iovec iovout;
+    int err;
+
+    buf_init(&pkt, 0);
+    buf_add_data(&pkt, msg);
+    buf_clear(msg);
+    buf_to_iov(&pkt, &iovout);
+    err = do_write(fd, &iovout, 1);
+    buf_clear(&pkt);
+    if (err == -1)
+        return -1;
+
+    return 0;
+}
+
+static int connect_to_mux(char *control_path, char *sftp_server)
+{
+	int err;
+	int sock;
+	struct sockaddr_un addr;
+	socklen_t sun_len;
+	struct buffer msg;
+	uint32_t msg_type, protocol_version, session_id, msg_rid;
+	int sockpair[2];
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	sun_len = offsetof(struct sockaddr_un, sun_path) + strlen(control_path) + 1;
+
+	if (strlen(control_path) >= sizeof(addr.sun_path)) {
+		fprintf(stderr, "control path for mux master too long\n");
+		return -1;
+	}
+
+	strcpy(addr.sun_path, control_path);
+	sock = socket(PF_UNIX, SOCK_STREAM, 0);
+	if (sock == -1) {
+		perror("failed to create socket");
+		return -1;
+	}
+
+	err = connect(sock, (struct sockaddr *)&addr, sun_len);
+	if (err == -1) {
+		perror("failed to connect");
+		goto out;
+	}
+
+	buf_init(&msg, 0);
+
+	/* exchange hello mesage */
+	buf_add_uint32(&msg, SSHMUX_MSG_HELLO);
+	buf_add_uint32(&msg, SSHMUX_VERSION);
+	if (send_mux_message(sock, &msg) == -1)
+		goto out;
+
+	/* receive reply */
+	if (recv_mux_message(sock, &msg) == -1)
+		goto out;
+
+	/* check message type and mux protocol version */
+	if (buf_get_uint32(&msg, &msg_type) == -1 ||
+	    buf_get_uint32(&msg, &protocol_version) == -1) {
+		buf_clear(&msg);
+		fprintf(stderr, "invalid reply from mux master\n");
+		goto out;
+	}
+	buf_clear(&msg);
+
+	if (msg_type != SSHMUX_MSG_HELLO) {
+		fprintf(stderr, "wrong reply mesage from mux master: %u\n",
+		        msg_type);
+		goto out;
+	}
+	if (protocol_version != SSHMUX_VERSION) {
+		fprintf(stderr, "incompatible mux protocol version: %u\n",
+		        protocol_version);
+		goto out;
+	}
+
+	if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockpair) == -1) {
+		perror("failed to create socket pair");
+		goto out;
+	}
+
+	/* request new sftp subsystem session */
+	buf_add_uint32(&msg, SSHMUX_C_NEW_SESSION);
+	buf_add_uint32(&msg, 1); /* request id */
+	buf_add_string(&msg, ""); /* reserved string */
+	buf_add_uint32(&msg, 0); /* want tty flag */
+	buf_add_uint32(&msg, 0); /* want X11 forwarding flag */
+	buf_add_uint32(&msg, 0); /* want agent flag */
+	buf_add_uint32(&msg, 1); /* subsystem flag */
+	buf_add_uint32(&msg, 0xffffffff); /* escape char */
+	buf_add_string(&msg, ""); /* terminal type */
+	buf_add_string(&msg, sftp_server); /* command/subsystem */
+	if (send_mux_message(sock, &msg) == -1)
+		goto out;
+
+	/* send stdin/stdout/stderr */
+	if (mm_send_fd(sock, sockpair[1]) == -1 ||
+	    mm_send_fd(sock, sockpair[1]) == -1 ||
+	    mm_send_fd(sock, STDERR_FILENO) == -1)
+		goto out;
+
+	/* get reply from mux server */
+	if (recv_mux_message(sock, &msg) == -1)
+		goto out;
+
+	if (buf_get_uint32(&msg, &msg_type) == -1 ||
+	    buf_get_uint32(&msg, &msg_rid) == -1) {
+		buf_clear(&msg);
+		fprintf(stderr, "invalid reply from mux master\n");
+		goto out;
+	}
+
+	if (msg_rid != 1) {
+		buf_clear(&msg);
+		fprintf(stderr, "unknown request id from mux master: %u\n",
+		        msg_rid);
+		goto out;
+	}
+
+	if (msg_type == SSHMUX_S_PERMISSION_DENIED ||
+	    msg_type == SSHMUX_S_FAILURE) {
+		char *message = "permission denied by mux master";
+		char *reason;
+		if (msg_type == SSHMUX_S_FAILURE)
+			message = "failure while setting up new session";
+		err = buf_get_string(&msg, &reason);
+		buf_clear(&msg);
+		if (err == -1)
+			reason = strdup("unknwon reason");
+		fprintf(stderr, "%s: %s\n", message, reason);
+		free(reason);
+		goto out;
+	} else if (msg_type != SSHMUX_S_SESSION_OPENED ||
+		buf_get_uint32(&msg, &session_id) == -1) {
+		buf_clear(&msg);
+		fprintf(stderr, "invalid reply message from mux master\n");
+		goto out;
+	}
+	buf_clear(&msg);
+
+	/* done? */
+
+	sshfs.rfd = sockpair[0];
+	sshfs.wfd = sockpair[0];
+	close(sockpair[1]);
+	sshfs.control_sock = sock;
+
+	return 0;
+
+out:
+	close(sock);
+	return -1;
+}
+
+static int do_write(int fd, struct iovec *iov, size_t count)
 {
 	int res;
 	while (count) {
-		res = writev(sshfs.wfd, iov, count);
+		res = writev(fd, iov, count);
 		if (res == -1) {
 			perror("write");
 			return -1;
@@ -1285,19 +1499,19 @@ static int sftp_send_iov(uint8_t type, uint32_t id, struct iovec iov[],
 	for (i = 0; i < count; i++)
 		iovout[nout++] = iov[i];
 	pthread_mutex_lock(&sshfs.lock_write);
-	res = do_write(iovout, nout);
+	res = do_write(sshfs.wfd, iovout, nout);
 	pthread_mutex_unlock(&sshfs.lock_write);
 	buf_free(&buf);
 	return res;
 }
 
-static int do_read(struct buffer *buf)
+static int do_read(int fd, struct buffer *buf)
 {
 	int res;
 	uint8_t *p = buf->p;
 	size_t size = buf->size;
 	while (size) {
-		res = read(sshfs.rfd, p, size);
+		res = read(fd, p, size);
 		if (res == -1) {
 			perror("read");
 			return -1;
@@ -1317,7 +1531,7 @@ static int sftp_read(uint8_t *type, struct buffer *buf)
 	struct buffer buf2;
 	uint32_t len;
 	buf_init(&buf2, 5);
-	res = do_read(&buf2);
+	res = do_read(sshfs.rfd, &buf2);
 	if (res != -1) {
 		if (buf_get_uint32(&buf2, &len) == -1)
 			return -1;
@@ -1328,7 +1542,7 @@ static int sftp_read(uint8_t *type, struct buffer *buf)
 		if (buf_get_uint8(&buf2, type) == -1)
 			return -1;
 		buf_init(buf, len - 1);
-		res = do_read(buf);
+		res = do_read(sshfs.rfd, buf);
 	}
 	buf_free(&buf2);
 	return res;
@@ -1471,6 +1685,10 @@ static void close_conn(void)
 		close(sshfs.ptyslavefd);
 		sshfs.ptyslavefd = -1;
 	}
+	if (sshfs.control_sock != -1) {
+		close(sshfs.control_sock);
+		sshfs.control_sock = -1;
+	}
 }
 
 static void *process_requests(void *data_)
@@ -1524,7 +1742,7 @@ static int sftp_init_reply_ok(struct buffer *buf, uint32_t *version)
 		struct buffer buf2;
 
 		buf_init(&buf2, len - 5);
-		if (do_read(&buf2) == -1) {
+		if (do_read(sshfs.rfd, &buf2) == -1) {
 			buf_free(&buf2);
 			return -1;
 		}
@@ -1567,7 +1785,7 @@ static int sftp_find_init_reply(uint32_t *version)
 	struct buffer buf;
 
 	buf_init(&buf, 9);
-	res = do_read(&buf);
+	res = do_read(sshfs.rfd, &buf);
 	while (res != -1) {
 		struct buffer buf2;
 
@@ -1581,7 +1799,7 @@ static int sftp_find_init_reply(uint32_t *version)
 		buf.len = 0;
 		buf2.p = buf.p + buf.size - 1;
 		buf2.size = 1;
-		res = do_read(&buf2);
+		res = do_read(sshfs.rfd, &buf2);
 	}
 	buf_free(&buf);
 	return res;
@@ -1764,6 +1982,8 @@ static int connect_remote(void)
 		err = connect_slave();
 	else if (sshfs.directport)
 		err = connect_to(sshfs.host, sshfs.directport);
+	else if (sshfs.control_path)
+		err = connect_to_mux(sshfs.control_path, "sftp" /* sshfs.sftp_server */);
 	else
 		err = start_ssh();
 	if (!err)
@@ -3511,6 +3731,19 @@ static int sshfs_opt_proc(void *data, const char *arg, int key,
 		g_free(tmp);
 		return 0;
 
+	case KEY_CONTROLPATH:
+		if (sshfs.control_path)
+			free(sshfs.control_path);
+		sshfs.control_path = NULL;
+		if (strcmp("none", arg + 2))
+			/* we use the control path directly */
+			sshfs.control_path = strdup(arg + 2);
+		else
+			/* the user don't want to use a control path
+			   pass this on to the ssh command */
+			ssh_add_arg("-Snone");
+		return 0;
+
 	case KEY_HELP:
 		usage(outargs->argv[0]);
 		fuse_opt_add_arg(outargs, "-ho");
@@ -3973,6 +4206,8 @@ int main(int argc, char *argv[])
 	sshfs.wfd = -1;
 	sshfs.ptyfd = -1;
 	sshfs.ptyslavefd = -1;
+	sshfs.control_path = NULL;
+	sshfs.control_sock = -1;
 	sshfs.delay_connect = 0;
 	sshfs.slave = 0;
 	sshfs.detect_uid = 0;
@@ -4075,7 +4310,10 @@ int main(int argc, char *argv[])
 		ssh_add_arg("-s");
 
 	ssh_add_arg(sftp_server);
-	free(sshfs.sftp_server);
+	if (sshfs.sftp_server != sftp_server) {
+		free(sshfs.sftp_server);
+		sshfs.sftp_server = strdup(sftp_server);
+	}
 
 
 	res = cache_parse_options(&args);

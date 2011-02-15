@@ -2,7 +2,7 @@
 
 bin_PROGRAMS = sshfs
 
-sshfs_SOURCES = sshfs.c cache.c cache.h
+sshfs_SOURCES = sshfs.c cache.c cache.h fdpass.c fdpass.h
 if FUSE_OPT_COMPAT
 sshfs_SOURCES += compat/fuse_opt.c compat/fuse_opt.h
 endif

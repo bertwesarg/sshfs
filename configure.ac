@@ -67,5 +67,59 @@ case "$osname" in
 esac
 AC_SUBST(IDMAP_DEFAULT)
 
+AC_CHECK_HEADERS([poll.h sys/un.h])
+AC_CHECK_FUNCS([sendmsg recvmsg])
+
+dnl make sure we're using the real structure members and not defines
+AC_CACHE_CHECK([for msg_accrights field in struct msghdr],
+		ac_cv_have_accrights_in_msghdr, [
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+		]], [[
+#ifdef msg_accrights
+#error "msg_accrights is a macro"
+exit(1);
+#endif
+struct msghdr m;
+m.msg_accrights = 0;
+exit(0);
+		]])],
+		[ ac_cv_have_accrights_in_msghdr="yes" ],
+		[ ac_cv_have_accrights_in_msghdr="no" ]
+	)
+])
+if test "x$ac_cv_have_accrights_in_msghdr" = "xyes" ; then
+	AC_DEFINE([HAVE_ACCRIGHTS_IN_MSGHDR], [1],
+		[Define if your system uses access rights style
+		file descriptor passing])
+fi
+
+AC_CACHE_CHECK([for msg_control field in struct msghdr],
+		ac_cv_have_control_in_msghdr, [
+	AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
+		]], [[
+#ifdef msg_control
+#error "msg_control is a macro"
+exit(1);
+#endif
+struct msghdr m;
+m.msg_control = 0;
+exit(0);
+		]])],
+		[ ac_cv_have_control_in_msghdr="yes" ],
+		[ ac_cv_have_control_in_msghdr="no" ]
+	)
+])
+if test "x$ac_cv_have_control_in_msghdr" = "xyes" ; then
+	AC_DEFINE([HAVE_CONTROL_IN_MSGHDR], [1],
+		[Define if your system uses ancillary data style
+		file descriptor passing])
+fi
+
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
