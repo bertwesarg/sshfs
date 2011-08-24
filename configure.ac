@@ -5,6 +5,7 @@ AM_CONFIG_HEADER(config.h)
 
 AC_PROG_CC
 AM_PROG_CC_C_O
+AC_CANONICAL_HOST
 CFLAGS="$CFLAGS -Wall -W"
 LIBS=
 AC_SEARCH_LIBS(dlsym, [dl])
@@ -67,8 +68,8 @@ case "$osname" in
 esac
 AC_SUBST(IDMAP_DEFAULT)
 
-AC_CHECK_HEADERS([poll.h sys/un.h])
-AC_CHECK_FUNCS([sendmsg recvmsg])
+AC_CHECK_HEADERS([poll.h sys/pstat.h sys/un.h vis.h])
+AC_CHECK_FUNCS([sendmsg recvmsg setproctitle strnvis vsnprintf])
 
 dnl make sure we're using the real structure members and not defines
 AC_CACHE_CHECK([for msg_accrights field in struct msghdr],
@@ -120,6 +121,97 @@ if test "x$ac_cv_have_control_in_msghdr" = "xyes" ; then
 		[Define if your system uses ancillary data style
 		file descriptor passing])
 fi
+
+AC_CACHE_CHECK([if libc defines __progname], ac_cv_libc_defines___progname, [
+	AC_LINK_IFELSE([AC_LANG_PROGRAM([[]],
+		[[ extern char *__progname; printf("%s", __progname); ]])],
+	[ ac_cv_libc_defines___progname="yes" ],
+	[ ac_cv_libc_defines___progname="no"
+	])
+])
+if test "x$ac_cv_libc_defines___progname" = "xyes" ; then
+	AC_DEFINE([HAVE___PROGNAME], [1], [Define if libc defines __progname])
+fi
+
+# Check for some target-specific stuff
+case "$host" in
+*-*-aix*)
+	AC_DEFINE([SPT_TYPE], [SPT_REUSEARGV],
+		[Define to a Set Process Title type if your system is
+		supported by bsd-setproctitle.c])
+	;;
+*-*-cygwin*)
+	;;
+*-*-dgux*)
+	;;
+*-*-darwin*)
+	;;
+*-*-dragonfly*)
+	;;
+*-*-haiku*)
+	;;
+*-*-hpux*)
+	AC_DEFINE([SPT_TYPE], [SPT_PSTAT])
+	;;
+*-*-irix5*)
+	;;
+*-*-irix6*)
+	;;
+*-*-k*bsd*-gnu | *-*-kopensolaris*-gnu)
+	AC_DEFINE([SPT_TYPE], [SPT_REUSEARGV])
+	;;
+*-*-linux*)
+	AC_DEFINE([SPT_TYPE], [SPT_REUSEARGV])
+	;;
+mips-sony-bsd|mips-sony-newsos4)
+	;;
+*-*-netbsd*)
+	;;
+*-*-freebsd*)
+	;;
+*-*-bsdi*)
+	;;
+*-next-*)
+	;;
+*-*-openbsd*)
+	;;
+*-*-solaris*)
+	;;
+*-*-sunos4*)
+	;;
+*-ncr-sysv*)
+	;;
+*-sni-sysv*)
+	;;
+# UnixWare 1.x, UnixWare 2.x, and others based on code from Univel.
+*-*-sysv4.2*)
+	;;
+# UnixWare 7.x, OpenUNIX 8
+*-*-sysv5*)
+	;;
+*-*-sysv*)
+	;;
+# SCO UNIX and OEM versions of SCO UNIX
+*-*-sco3.2v4*)
+	;;
+# SCO OpenServer 5.x
+*-*-sco3.2v5*)
+	;;
+*-*-unicosmk*)
+	;;
+*-*-unicosmp*)
+	;;
+*-*-unicos*)
+	;;
+*-dec-osf*)
+	;;
+*-*-nto-qnx*)
+	;;
+*-*-ultrix*)
+	;;
+*-*-lynxos)
+	;;
+esac
 
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT

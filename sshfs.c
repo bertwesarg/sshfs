@@ -54,6 +54,7 @@
 
 #include "cache.h"
 
+#include "setproctitle.h"
 #include "fdpass.h"
 
 #ifndef MAP_LOCKED
@@ -241,6 +242,7 @@ struct sshfs {
 	char *control_path;
 	struct fuse_args ssh_args;
 	char *workarounds;
+	char *user_mount_opts;
 	int rename_workaround;
 	int nodelay_workaround;
 	int nodelaysrv_workaround;
@@ -433,6 +435,10 @@ static struct fuse_opt sshfs_opts[] = {
 	FUSE_OPT_KEY("-f",             KEY_FOREGROUND),
 	FUSE_OPT_KEY("-F ",            KEY_CONFIGFILE),
 	FUSE_OPT_KEY("-S ",            KEY_CONTROLPATH),
+	FUSE_OPT_END
+};
+
+static struct fuse_opt sshfs_null_opts[] = {
 	FUSE_OPT_END
 };
 
@@ -3692,6 +3698,24 @@ static int sshfs_fuse_main(struct fuse_args *args)
 #endif
 }
 
+static int sshfs_opt_safe_proc(void *data, const char *arg, int key,
+                               struct fuse_args *outargs)
+{
+	(void) data;
+	(void) outargs;
+
+	switch (key) {
+	case FUSE_OPT_KEY_OPT:
+		if (arg[0] != '-')
+			fuse_opt_add_opt(&sshfs.user_mount_opts, arg);
+		break;
+	default:
+		break;
+	}
+
+	return 1;
+}
+
 static int sshfs_opt_proc(void *data, const char *arg, int key,
                           struct fuse_args *outargs)
 {
@@ -4185,6 +4209,23 @@ int main(int argc, char *argv[])
 		memset(sshfs_program_path, 0, PATH_MAX);
 	}
 #endif /* __APPLE__ */
+	__progname = get_progname(argv[0]);
+
+#ifndef HAVE_SETPROCTITLE
+	/* Prepare for later setproctitle emulation */
+	{
+		/* Save argv. Duplicate so setproctitle emulation doesn't clobber it */
+		char **saved_argv = calloc(argc + 1, sizeof(*saved_argv));
+		int i;
+		for (i = 0; i < argc; i++)
+			saved_argv[i] = strdup(argv[i]);
+		saved_argv[i] = NULL;
+		compat_init_setproctitle(argc, argv);
+		args.argv = saved_argv;
+		args.allocated = 1;
+	}
+#endif
+
 	g_thread_init(NULL);
 
 	sshfs.blksize = 4096;
@@ -4201,7 +4242,7 @@ int main(int argc, char *argv[])
 	sshfs.truncate_workaround = 0;
 	sshfs.buflimit_workaround = 1;
 	sshfs.ssh_ver = 2;
-	sshfs.progname = argv[0];
+	sshfs.progname = __progname;
 	sshfs.rfd = -1;
 	sshfs.wfd = -1;
 	sshfs.ptyfd = -1;
@@ -4225,6 +4266,9 @@ int main(int argc, char *argv[])
 	ssh_add_arg("-x");
 	ssh_add_arg("-a");
 	ssh_add_arg("-oClearAllForwardings=yes");
+
+	/* safe all -o options for the proctitle */
+	fuse_opt_parse(&args, NULL, sshfs_null_opts, sshfs_opt_safe_proc);
 
 	if (fuse_opt_parse(&args, &sshfs, sshfs_opts, sshfs_opt_proc) == -1 ||
 	    parse_workarounds() == -1)
@@ -4285,7 +4329,7 @@ int main(int argc, char *argv[])
 
 	if (!sshfs.host) {
 		fprintf(stderr, "missing host\n");
-		fprintf(stderr, "see `%s -h' for usage\n", argv[0]);
+		fprintf(stderr, "see `%s -h' for usage\n", __progname);
 		exit(1);
 	}
 
@@ -4416,6 +4460,13 @@ int main(int argc, char *argv[])
 			fuse_destroy(fuse);
 			exit(1);
 		}
+
+		/* imitate a mount(1) line output in the proc title */
+		setproctitle("%s:%s on %s%s%s%s", sshfs.host, sshfs.base_path,
+		             mountpoint,
+		             sshfs.user_mount_opts ? " (" : "",
+		             sshfs.user_mount_opts ? sshfs.user_mount_opts : "",
+		             sshfs.user_mount_opts ? ")" : "" );
 
 		if (multithreaded)
 			res = fuse_loop_mt(fuse);
